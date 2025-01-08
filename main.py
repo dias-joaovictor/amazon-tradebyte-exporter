@@ -1,10 +1,32 @@
 import os
 import csv
+import shutil
+
 from pymongo import MongoClient
 import xml.etree.ElementTree as ET
 import uuid
 import xml.dom.minidom as minidom
+from datetime import datetime
 
+
+def clear_directory(directory_path):
+    """
+    Removes all files and subdirectories in the given directory.
+    :param directory_path: Path to the directory to be cleared.
+    """
+    if not os.path.exists(directory_path):
+        print(f"Directory {directory_path} does not exist.")
+        return
+
+    for item in os.listdir(directory_path):
+        item_path = os.path.join(directory_path, item)
+        try:
+            if os.path.isfile(item_path) or os.path.islink(item_path):
+                os.unlink(item_path)  # Delete the file or symbolic link
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)  # Delete the directory and its contents
+        except Exception as e:
+            print(f"Failed to delete {item_path}. Reason: {e}")
 
 def parse_txt_to_objects(file_path):
     """
@@ -17,8 +39,35 @@ def parse_txt_to_objects(file_path):
     with open(file_path, 'r', encoding='utf-8') as file:
         reader = csv.DictReader(file, delimiter='\t')
         for row in reader:
+            row["order_date"] = datetime.fromisoformat(row["purchase-date"])
             objects.append(row)
     return objects
+
+
+def query_mongodb(database="amazon_orders", collection="orders"):
+    """
+    Query MongoDB with a specific filter.
+
+    :param database: Database name in MongoDB.
+    :param collection: Collection name in MongoDB.
+    :return: List of matching documents.
+    """
+    query = {
+        "order_date": {
+            "$gt": datetime(2024, 12, 23, 13, 45, 0),  # Start date
+            "$lt": datetime(2025, 1, 2, 17, 15, 0)     # End date
+        },
+        "is-buyer-requested-cancellation": "false"
+    }
+
+    client = MongoClient("mongodb://root:root@localhost:27017/")
+    db = client[database]
+    col = db[collection]
+
+    # Execute the query
+    results = list(col.find(query))
+    print(f"Found {len(results)} matching records.")
+    return results
 
 
 def save_to_mongodb(data, database="amazon_orders", collection="orders"):
@@ -85,7 +134,7 @@ def generate_amazon_xml(orders, merchant_id="A2DKZN1W9ZO5KL"):
 
     # Create a message for each order
     for message_id, order_id in enumerate(orders, start=1):
-        order = orders[order_id]["items"][0]
+        order = orders[order_id]["orders"][0]
 
         message = ET.SubElement(amazon_envelope, "Message")
         ET.SubElement(message, "MessageID").text = str(message_id)
@@ -136,7 +185,7 @@ def generate_amazon_xml(orders, merchant_id="A2DKZN1W9ZO5KL"):
         ET.SubElement(order_report, "IsIba").text = str(order.get("is-iba", False)).lower()
 
         # Add Items for the Order
-        for item in orders[order_id]["items"]:
+        for item in orders[order_id]["orders"]:
             item_element = ET.SubElement(order_report, "Item")
             ET.SubElement(item_element, "AmazonOrderItemCode").text = item["order-item-id"]
             ET.SubElement(item_element, "SKU").text = item["sku"]
@@ -177,10 +226,11 @@ def generate_amazon_xml(orders, merchant_id="A2DKZN1W9ZO5KL"):
 
 
 def run():
+    clear_directory("out/")
     # Folder and file configurations
     input_folder = "in/"
     database = "amazon_orders"
-    collection = "orders"
+    order_grouped_with_order_lines = "orders"
 
     # Loop through all TXT files in the input folder
     for file_name in os.listdir(input_folder):
@@ -193,23 +243,41 @@ def run():
             print(f"Parsed {len(data)} records from {file_name}.")
 
             # Save parsed data to MongoDB
-            save_to_mongodb(data, database, collection)
+            save_to_mongodb(data, database, order_grouped_with_order_lines)
+            print(f"Saved {len(data)} records to {database}.")
+
+            data = query_mongodb()
+            print(f"Retrieved {len(data)} records.")
+            
+            
             print(f"Finished processing {file_name}.\n")
 
-            collection = {}
-
+            collection_per_channel = {}
             for item in data:
-                order_id = item["order-id"]
-                if order_id not in collection:
-                    collection[order_id] = {"items": []}  # Initialize with an empty items list
+                channel = item["sales-channel"]
+                if channel not in collection_per_channel:
+                    collection_per_channel[channel] = []
+                collection_per_channel[channel].append(item)
 
-                collection[order_id]["items"].append(item)
 
+            counter = 0
+            for channel_name, orders in collection_per_channel.items():
+                order_grouped_with_order_lines = {}
 
-            xml_report = generate_amazon_xml(collection)
-            save_xml_to_out_directory(xml_report, "output.xml", "output.formatted.xml")
+                for order in orders:
+                    order_id = order["order-id"]
+                    if order_id not in order_grouped_with_order_lines:
+                        order_grouped_with_order_lines[order_id] = {"orders": []}
 
-            print("Finished processing {file_name}.")
+                    order_grouped_with_order_lines[order_id]["orders"].append(order)
+
+                counter = counter + len(order_grouped_with_order_lines)
+                xml_report = generate_amazon_xml(order_grouped_with_order_lines)
+                save_xml_to_out_directory(xml_report, f'{channel_name}.xml', f"{channel_name}.formatted.xml")
+
+                print(f"Finished processing {channel_name} channel.")
+
+            print(f"Finished processing. Total {counter} records.")
 
 
 if __name__ == "__main__":
